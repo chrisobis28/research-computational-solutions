@@ -1,4 +1,4 @@
-# DSAIT4200 Coursework B — Analysis of a Transfer-Learning Experiment
+# Analysis of a Transfer-Learning Experiment
 
 Reproducible statistical analysis of an experiment comparing transfer-learning
 models against non-transfer baselines, written in R Markdown. The analysis
