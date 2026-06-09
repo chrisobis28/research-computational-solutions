@@ -1,0 +1,388 @@
+---
+title: "DSAIT4200 Coursework B --- A Transfer Learning Experiment"
+author: "Melani Evangelou, Luca Ionescu, Chris Obis, Maksym Ziemlewski"
+date: "`r format(Sys.Date())`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    df_print: paged
+  pdf_document:
+    toc: true
+subtitle: Reproducible analysis
+editor_options:
+  chunk_output_type: console
+  markdown:
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 7, fig.height = 3, dpi = 130)
+```
+
+# Purpose and approach
+
+The experiment measures a **metric score in `[0, 1]`** for nine models
+on seven test datasets (`TeD`). Transfer-learning models are trained on
+subsets of eight training datasets (`TrD1..TrD8`). We answer:
+
+- **RQ1** - does transfer learning beat non-transfer baselines?
+- **RQ2** - how do the **number** and **identity** of training datasets,
+  and the **depth of refinement**, affect performance?
+
+To achieve this, we will: (1) explore the data, (2) fit a **large
+preliminary model and rank effects with Type-II ANOVA** to guide the
+analysis, (3) **transform the response per test dataset** (within-`TeD`
+standardization) so effects are comparable across test sets, (4) build
+structure-aware models and report **effect sizes with confidence
+intervals** (in SD units), and (5) confirm everything with a
+bounded-response **logit / quasi-binomial** model.
+
+```{r libs}
+# install.packages(c("tidyverse","car","emmeans","broom","patchwork"))
+library(patchwork); library(tidyverse); library(car); library(emmeans); library(broom)
+theme_set(theme_bw(base_size = 11)); emm_options(rg.limit = 200000)
+```
+
+# Data preparation
+
+We derive the non-explicit factors: the **number** of training datasets
+`n_trd`, the architecture `model_type`, `model_group` (Baseline vs
+Transfer), the broad `task_type`, the **refinement depth** of the
+multi-`TrD` models (`MN`=0 ... `MF`=4), the **within-`TeD`
+standardized** score `z` (primary response, SD-of-that-TeD units), and a
+clamped **logit** for the bounded-response robustness check.
+
+```{r prep}
+d <- readr::read_csv("data.csv", show_col_types = FALSE)
+trd_cols <- paste0("TrD", 1:8); eps <- 0.005
+
+d <- d |>
+  mutate(
+    n_trd       = rowSums(across(all_of(trd_cols))),
+    model_group = if_else(model %in% c("B1","B2","B3"), "BL", "TR"),
+    model_type  = if_else(model %in% c("B1","B2","B3"), "Baseline", model),
+    task_type   = case_when(TeD %in% paste0("TeD",1:4) ~ "Classification",
+                            TeD == "TeD5" ~ "Recommendation", TRUE ~ "Regression"),
+    depth       = case_when(model_type=="MN"~0, model_type=="M1"~1, model_type=="M2"~2,
+                            model_type=="M3"~3, model_type=="MF"~4, TRUE~NA_real_),
+    logit       = qlogis(pmin(pmax(score, eps), 1 - eps))) |> # mapping (0,1) to the whole number line
+  
+  group_by(TeD) |> mutate(z = (score - mean(score)) / sd(score)) |> ungroup() |>
+  mutate(TeD        = factor(TeD, levels = paste0("TeD",1:7)),
+         model_group= factor(model_group, levels = c("BL","TR")),
+         model_type = factor(model_type, levels = c("Baseline","MS","MN","M1","M2","M3","MF")),
+         task_type  = factor(task_type, c("Classification","Recommendation","Regression")),
+         across(all_of(trd_cols), as.integer))
+
+table(d$model_type, d$n_trd)     # exposes the structural confound
+```
+
+The cross-tabulation shows **aliasing**: baselines always use 0 training
+sets, `MS` always 1, `Mx` span 2--8. So "number of datasets",
+"single-vs-multi" and "baseline-vs-transfer" cannot be separated
+globally. We isolate each effect on the appropriate subset.
+
+# Exploratory data analysis
+
+```{r eda, fig.width=12, fig.height=3.2}
+het <- d |> group_by(TeD, task_type) |>
+  summarise(mean=mean(score), sd=sd(score), min=min(score), max=max(score),
+            n=n(), .groups="drop"); het
+cat(sprintf("within-TeD SD ranges %.3f-%.3f  (%.1fx)\n", min(het$sd), max(het$sd),
+            max(het$sd)/min(het$sd)))
+
+p1 <- ggplot(d, aes(score)) + geom_histogram(bins=40, fill="#34495e", colour="white",
+      linewidth=.1) + labs(x="metric score", y="count", title="(a) Response bounded in [0,1]")
+p2 <- ggplot(d, aes(TeD, score, fill=task_type)) + geom_boxplot(outlier.size=.3, linewidth=.3) +
+  scale_fill_manual(values=c(Classification="#2471a3",Recommendation="#e67e22",Regression="#27ae60")) +
+  labs(x=NULL, y="metric score", fill=NULL, title="(b) Scale differs ~15x across test sets")
+
+(p1 | p2)
+```
+
+# Large preliminary model and ANOVA
+
+We fit a large model with all available factors and key interactions and
+rank effects with **Type-II** sums of squares (order-independent under
+the unbalanced design).
+
+```{r anova-first}
+m_big <- lm(score ~ TeD * model_type + TeD:n_trd, data = d)
+Anova(m_big, type = 2) |> tidy() |>
+  mutate(pct_SS = round(100*sumsq/sum(sumsq), 1)) |> arrange(desc(pct_SS))
+```
+
+`TeD` alone is \~93% of the sum of squares. Two consequences drive the
+rest of the analysis: (1) a high overall `R^2` is uninformative (it just
+reflects task differences), so we must **control for `TeD`**, and, (2)
+because the test sets differ in scale by \~15x, raw effects are **not
+comparable across `TeD`**.
+
+# Transform for homogeneity: within-`TeD` standardization
+
+Standardizing the score within each test set removes the between-`TeD`
+scale and ensures **variance homogeneity** (every `TeD` has SD 1), so an
+effect can be read as "how many SD of *that* test set". This is our
+primary response. A clamped **logit**, which respects the `[0,1]` bound,
+is used later as a robustness check.
+
+```{r primary-model}
+m_raw <- lm(score ~ TeD * model_type, data = d)   # natural scale (for intuition)
+m_z   <- lm(z     ~ TeD * model_type, data = d)   # PRIMARY: SD-of-that-TeD units
+summary(m_z)$adj.r.squared # expected to be lower than the raw R^2 because z already removed the giant TeD variance, leaving the interesting part to be explained
+```
+
+## Goodness of fit
+
+```{r diagnostics, fig.height=3}
+par(mfrow = c(1, 3))
+plot(m_raw, which = 1, main = "(a) raw: variance funnel") # funnel -> spread grows with the fitted value = heteroscedasticity
+# (homoscedasticity = residual variance constant across fitted values, violated here)
+plot(m_z,   which = 1, main = "(b) per-TeD std: even") # spread is now expected to be even across fitted values (assumption satisfied)
+plot(m_z,   which = 2, main = "(c) std model Q-Q") # Normal Q-Q: residuals sorted vs what a Normal predicts; on the diagonal = ~Normal
+par(mfrow = c(1, 1))
+```
+
+The variance funnel of the raw model flattens after per-`TeD`
+standardization. The Q-Q is straight apart from a mild left tail from
+some genuine near-zero scores in `TeD7`. This is not a concern at
+`n = 2996`, where the Central Limit Theorem makes coefficient inference
+robust to non-Normality, and any residual non-constant variance does not
+change our conclusions, which we confirm with the logit and
+quasi-binomial models.
+
+## Robustness models
+
+We refit the same model two other ways, respecting the [0,1] bound, to
+later check that the conclusions don't depend on the standardization
+trick.
+
+```{r robustness}
+m_logit <- lm(logit ~ TeD * model_type, data = d) # models the logit of the score, unsquishing the scale, with an ordinary linear model
+m_qb    <- glm(pmin(pmax(score,eps),1-eps) ~ TeD * model_type,
+               family = quasibinomial(), data = d) # a generalized linear model, keeps the predictions inside [0,1] and assumes proportion-like variance with a flexible dispersion
+cat("quasi-binomial dispersion:", round(summary(m_qb)$dispersion,3), "\n") # the dispersion (how spread-out the data is vs. a strict binomial)
+```
+
+# RQ1 - Does transfer learning beat the baselines?
+
+Effect sizes are differences in **SD units** of each test set, with 95%
+confidence intervals.
+
+```{r rq1}
+emm <- emmeans(m_z, ~ model_type | TeD) # adjusted mean (in SD-of-TeD units) for each architecture, within each test set
+
+contrast(emm, method = list("TR - BL" = c(-1, rep(1/6, 6))), by = "TeD") |>
+  summary(infer = TRUE) # weights are aligned to model_type: Baseline, MS, MN, M1, M2, M3, MF -> -1 on Baseline, 1/6 on each of the 6 transfer-based ones -> avg transfer - baseline.
+
+contrast(emmeans(m_z, ~ model_type), method = list("TR - BL" = c(-1, rep(1/6, 6)))) |>
+  summary(infer = TRUE) # same contrast, but on EMMs pooled over all test sets (single overall SD figure)
+
+contrast(emmeans(m_z, ~ model_type), method = "trt.vs.ctrl", ref = 1) |>
+  summary(infer = TRUE) # Dunnett ("Treatment vs Control") -> each architecture - baseline control, pooled over test sets
+
+m_raw_grp <- lm(score ~ TeD * model_group, data = d) # separate raw score model using the BL/TR grouping to see real-scale numbers
+emmeans(m_raw_grp, ~ model_group | TeD) |> summary() # baseline vs transfer mean score per test set
+```
+
+Transfer beats baseline overall (\~1.88 SD) and on **six of the seven**
+test sets. Only `TeD4` shows no benefit. The Dunnett contrasts order the
+architectures `MS < MN < M1 < M2 < M3 < MF`, all above baseline, meaning
+that more refinement leads to larger gain.
+
+We observe that the SE for the baseline is 0.041, whereas the transfer's
+is 0.0034 (12x more precise). This is because the baseline rests on only
+3 runs per test set, while the transfer has hundreds. This is also the
+reason for the wider confidence intervals.
+
+## Report figures
+
+```{r rq1-fig, fig.width=7, fig.height=5}
+# (a) raw EMMs: baseline vs transfer per test set
+raw_emm <- as.data.frame(emmeans(m_raw_grp, ~ model_group | TeD))
+pA <- ggplot(raw_emm, aes(TeD, emmean, colour = model_group)) +
+  geom_point(position = position_dodge(.4), size = 2) +
+  geom_errorbar(aes(ymin = lower.CL, ymax = upper.CL),
+                position = position_dodge(.4), width = .25) +
+  scale_colour_manual(values = c(BL = "#c0392b", TR = "#2471a3")) +
+  labs(x = NULL, y = "mean score (raw)", colour = NULL,
+       title = "(a) Raw scores: some gaps look negligible")
+
+# (b) transfer - baseline per test set, in SD units
+rq1_sd <- as.data.frame(summary(
+  contrast(emm, method = list("TR - BL" = c(-1, rep(1/6, 6))), by = "TeD"),
+  infer = TRUE)) |>
+  mutate(signif = lower.CL > 0 | upper.CL < 0)
+pB <- ggplot(rq1_sd, aes(TeD, estimate, fill = signif)) +
+  geom_col(alpha = .85) +
+  geom_errorbar(aes(ymin = lower.CL, ymax = upper.CL), width = .25) +
+  geom_hline(yintercept = 0, linewidth = .3) +
+  scale_fill_manual(values = c(`TRUE` = "#27ae60", `FALSE` = "#7f8c8d"), guide = "none") +
+  labs(x = NULL, y = "transfer - baseline (SD of that TeD)",
+       title = "(b) In context: transfer helps on 6/7")
+
+(pA / pB)
+```
+
+# RQ2 - Effect of the choice of training datasets
+
+We split RQ2 into its sub-questions, each with its own small model on
+the subset where that factor varies.
+
+## (a) Number of training datasets (multi-`TrD` subset)
+
+We only consider the 5 multi-source models where `n_trd` ranges from 2-8
+freely, breaking the baseline=0 and MS=1 confound. `n_c` represents
+"datasets above/below average", making the intercept and slope
+interpretable. We also fit a richer model with a square term I(n_c\^2),
+allowing the line to bend, then anova (small, big) tests "does the curve
+fit significantly better than the straight line?" or technically "does
+adding I(n_c\^2) drop the residual error by more than chance?".
+Significance, in this case, means that the straight line is too simple
+and a curvature is real. To know that it is diminishing, we check the
+sign of the I(n_c\^2) coefficient: negative = the curve bends downward =
+the slope shrinks as n_c grows = each extra dataset helps less =
+diminishing returns.
+
+```{r rq2-number}
+mx <- d |> filter(model_type %in% c("M1","M2","M3","MF","MN")) |>
+  mutate(n_c = n_trd - mean(n_trd))
+
+m_num <- lm(z ~ TeD + n_c, data = mx) # linear model, using + (one common slope, no interaction), TeD is here to control the task, n_c carries the effect of interest
+
+emtrends(m_num, ~ 1, var = "n_c") |> summary(infer = TRUE) # "how much z changes per +dataset" -> overall slope (different heights for each test set) because there is no TeD:n_c interaction
+
+anova(m_num, lm(z ~ TeD + n_c + I(n_c^2), data = mx))
+
+m_quad <- lm(z ~ TeD + n_c + I(n_c^2), data = mx)
+summary(m_quad)        # looking at the I(n_c^2) row, "Estimate" column
+```
+
+We notice that adding the term drops the residual error (RSS) from
+1821.7 to 1804.4, a reduction of 17.3 for 1 extra parameter, giving
+F=25.3 at p = 5.3e-07. So, the curve term is significant, although a
+minor part of the variance (17 out of 1822), which is what "diminishing
+returns" are, a subtle bend. The I(n_c\^2) coefficient is -0.025,
+therefore the curve is concave and the returns are diminishing. The
+linear term is 0.14 (SD per dataset on average).
+
+## Report Figures
+
+```{r rq2-fig, fig.width=7, fig.height=5}
+# (a) number-of-datasets trend (SD units, averaged over TeD)
+obs <- mx |> group_by(TeD, n_trd) |> summarise(z = mean(z), .groups = "drop") |>
+  group_by(n_trd) |> summarise(z = mean(z), .groups = "drop")
+newd <- expand.grid(TeD = levels(mx$TeD), n_trd = sort(unique(mx$n_trd)))
+newd$n_c  <- newd$n_trd - mean(mx$n_trd)
+newd$pred <- predict(m_quad, newdata = newd)
+fit <- newd |> group_by(n_trd) |> summarise(pred = mean(pred), .groups = "drop")
+pC <- ggplot() +
+  geom_point(data = obs, aes(n_trd, z), size = 2, colour = "#34495e") +
+  geom_line(data = fit, aes(n_trd, pred), colour = "#2471a3", linewidth = 1) +
+  labs(x = "number of training datasets", y = "score (SD units, avg over TeD)",
+       title = "(a) More datasets help, diminishing")
+
+# (b) each architecture vs baseline (Dunnett), SD units
+dunn <- as.data.frame(summary(
+  contrast(emmeans(m_z, ~ model_type), method = "trt.vs.ctrl", ref = 1), infer = TRUE)) |>
+  mutate(arch = factor(sub(" - Baseline", "", contrast),
+                       levels = c("MS","MN","M1","M2","M3","MF")))
+pD <- ggplot(dunn, aes(arch, estimate)) +
+  geom_col(fill = "#2471a3", alpha = .85) +
+  geom_errorbar(aes(ymin = lower.CL, ymax = upper.CL), width = .25) +
+  labs(x = NULL, y = "gain vs baseline (SD units)",
+       title = "(b) Deeper refinement, larger gain")
+
+(pC / pD)
+```
+
+## (b) Which training datasets help or hurt and when
+
+We filter out the non-transfer runs to keep the subset where the eight
+`TrD` vary. Next, we fit a linear model to a formula that gives each
+dataset a main effect and a `TeD` interaction and observe the effects
+(slopes). ANOVA also tells us if a more complex model that allows
+datasets to have a distinct effect depending on the target provides a
+better fit for the data or not, therefore a dataset's usefulness depends
+on the test set.
+
+```{r rq2-which}
+tr   <- d |> filter(n_trd >= 1)
+m_id <- lm(as.formula(paste("z ~ TeD * (", paste(trd_cols, collapse=" + "), ")")), data = tr) # z ~ TeD * (TrD1 + ... + TrD8)
+incl <- map_dfr(trd_cols, function(k){ # loop the function over each dataset name k
+  et <- summary(emtrends(m_id, ~ 1, var = k), infer = TRUE) # the slope of z w.r.t. TrD k, i.e. the effect of including/excluding the dataset, since TrD is coded 1/0
+  tibble(TrD=k, delta_SD=et[[paste0(k,".trend")]], lower=et[["lower.CL"]],
+         upper=et[["upper.CL"]], p=et[["p.value"]]) # one row result
+}) |> arrange(desc(delta_SD)); incl # most helpful first
+
+anova(lm(as.formula(paste("z ~ TeD +", paste(trd_cols, collapse="+"))), data=tr), m_id) # ANOVA to compare the 2 and see whether there a dataset's usefulness depends on the target task
+```
+
+We observe that including `TrD8/TrD5/TrD7` helps most.
+`TrD2/TrD3/TrD6/TrD4` help mildly. **`TrD1` hurts**. The `TrD - TeD`
+interaction is highly significant, cutting the RSS from 2028.7 to 1616.0
+(a difference of 412.7 points or 20% of Model 1's RSS) for those 48
+terms, with a significant F = 15.5 at p \< 2.2e-16: dataset usefulness
+depends on the target task.
+
+## Report figure
+
+```{r rq2-which-fig, fig.width=4, fig.height=2.8}
+ggplot(incl, aes(delta_SD, reorder(TrD, delta_SD), colour = delta_SD > 0)) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey40") +
+  geom_errorbarh(aes(xmin = lower, xmax = upper), height = .2) +
+  geom_point(size = 2) +
+  scale_colour_manual(values = c(`TRUE` = "#27ae60", `FALSE` = "#c0392b"), guide = "none") +
+  labs(x = "effect of including dataset (SD units, avg over TeD)", y = NULL,
+       title = "Which training sets help vs. hurt")
+```
+
+## (c) Refinement depth
+
+```{r rq2-depth}
+md <- d |> filter(model_type %in% c("MN","M1","M2","M3","MF"))
+emtrends(lm(z ~ TeD + depth, data = md), ~ 1, var = "depth") |> summary(infer = TRUE)
+```
+
+Filtering to the multi-source models, where `depth` runs 0-4, and
+fitting a linear model that controls for `TeD`, we read off the one
+common slope = SD gained per refined part (0.28, CI [0.26, 0.31]).
+
+# Robustness: do conclusions hold on the bounded (logit) scale?
+
+We define a reusable function that computest the per-test-set transfer -
+baseline contrast, with the same weights as in RQ1. Then, we match the
+m_z, m_logit and m_qb tables on TeD, renaming columns appropriately, and
+then flag whether all three agree in the direction per test set, i.e.
+the robustness verdict.
+
+```{r robust-check}
+chk <- function(model) contrast(emmeans(model, ~ model_type | TeD),
+        method = list(d = c(-1, rep(1/6,6))), by="TeD") |> summary() |>
+        transmute(TeD, est = estimate)
+chk(m_z)    |> rename(SD_units = est) |>
+  left_join(chk(m_logit) |> rename(logit    = est), by = "TeD") |>
+  left_join(chk(m_qb)    |> rename(quasibin = est), by = "TeD") |>
+  mutate(sign_agrees = sign(SD_units) == sign(logit) &
+           sign(SD_units) == sign(quasibin))
+```
+
+The results show that the modelling did not distort the results. 6 of 7
+test sets are `TRUE`, showing that on each one there is a real effect,
+agreed by 3 different ways of computation. `TeD4` = `FALSE` is a
+non-issue because, looking at its -0.003, +0.004, -0.003 values, they
+are essentially zero, flipping harmlessly between methods, and we can
+easily mark this as noise. This disagreement actually reinforces our
+RQ1, with `TeD4` having no real effect.
+
+# Session info
+
+We include the R version and every loaded package and version to ensure
+reproducibility.
+
+```{r session}
+sessionInfo()
+```
