@@ -167,7 +167,9 @@ m_qb    <- glm(pmin(pmax(score,eps),1-eps) ~ TeD * model_type,
 cat("quasi-binomial dispersion:", round(summary(m_qb)$dispersion,3), "\n") # the dispersion (how spread-out the data is vs. a strict binomial)
 ```
 
-# RQ1 - Does transfer learning beat the baselines?
+# RQ1 - Does transfer learning improve over typical non-transfer learning?
+
+## Transfer - Baseline comparison
 
 Effect sizes are differences in **SD units** of each test set, with 95%
 confidence intervals.
@@ -198,8 +200,6 @@ is 0.0034 (12x more precise). This is because the baseline rests on only
 3 runs per test set, while the transfer has hundreds. This is also the
 reason for the wider confidence intervals.
 
-## Report figures
-
 ```{r rq1-fig, fig.width=7, fig.height=5}
 # (a) raw EMMs: baseline vs transfer per test set
 raw_emm <- as.data.frame(emmeans(m_raw_grp, ~ model_group | TeD))
@@ -227,12 +227,35 @@ pB <- ggplot(rq1_sd, aes(TeD, estimate, fill = signif)) +
 (pA / pB)
 ```
 
-# RQ2 - Effect of the choice of training datasets
+## Transfer-model refinement depth analysis
 
-We split RQ2 into its sub-questions, each with its own small model on
-the subset where that factor varies.
+```{r rq1-depth}
+md <- d |> filter(model_type %in% c("MN","M1","M2","M3","MF"))
+emtrends(lm(z ~ TeD + depth, data = md), ~ 1, var = "depth") |> summary(infer = TRUE)
+```
 
-## (a) Number of training datasets (multi-`TrD` subset)
+Filtering to the multi-source models, where `depth` runs 0-4, and
+fitting a linear model that controls for `TeD`, we read off the one
+common slope = SD gained per refined part (0.28, CI [0.26, 0.31]).
+
+```{r rq1-figb, fig.width=7, fig.height=3}
+# (b) each architecture vs baseline (Dunnett), SD units
+dunn <- as.data.frame(summary(
+  contrast(emmeans(m_z, ~ model_type), method = "trt.vs.ctrl", ref = 1), infer = TRUE)) |>
+  mutate(arch = factor(sub(" - Baseline", "", contrast),
+                       levels = c("MS","MN","M1","M2","M3","MF")))
+pD <- ggplot(dunn, aes(arch, estimate)) +
+  geom_col(fill = "#2471a3", alpha = .85) +
+  geom_errorbar(aes(ymin = lower.CL, ymax = upper.CL), width = .25) +
+  labs(x = NULL, y = "gain vs baseline (SD units)",
+       title = "Deeper refinement, larger gain")
+
+pD
+```
+
+# RQ2 - How is the model performance affected by the choice of training datasets?
+
+## Number of training datasets (multi-`TrD` subset)
 
 We only consider the 5 multi-source models where `n_trd` ranges from 2-8
 freely, breaking the baseline=0 and MS=1 confound. `n_c` represents
@@ -253,7 +276,7 @@ mx <- d |> filter(model_type %in% c("M1","M2","M3","MF","MN")) |>
 
 m_num <- lm(z ~ TeD + n_c, data = mx) # linear model, using + (one common slope, no interaction), TeD is here to control the task, n_c carries the effect of interest
 
-emtrends(m_num, ~ 1, var = "n_c") |> summary(infer = TRUE) # "how much z changes per +dataset" -> overall slope (different heights for each test set) because there is no TeD:n_c interaction
+emtrends(m_num, ~ 1, var = "n_c") |> summary(infer = TRUE) # "how much z changes per dataset" -> overall slope (different heights for each test set) because there is no TeD:n_c interaction
 
 anova(m_num, lm(z ~ TeD + n_c + I(n_c^2), data = mx))
 
@@ -269,9 +292,7 @@ returns" are, a subtle bend. The I(n_c\^2) coefficient is -0.025,
 therefore the curve is concave and the returns are diminishing. The
 linear term is 0.14 (SD per dataset on average).
 
-## Report Figures
-
-```{r rq2-fig, fig.width=7, fig.height=5}
+```{r rq2-fig, fig.width=7, fig.height=3}
 # (a) number-of-datasets trend (SD units, averaged over TeD)
 obs <- mx |> group_by(TeD, n_trd) |> summarise(z = mean(z), .groups = "drop") |>
   group_by(n_trd) |> summarise(z = mean(z), .groups = "drop")
@@ -283,23 +304,12 @@ pC <- ggplot() +
   geom_point(data = obs, aes(n_trd, z), size = 2, colour = "#34495e") +
   geom_line(data = fit, aes(n_trd, pred), colour = "#2471a3", linewidth = 1) +
   labs(x = "number of training datasets", y = "score (SD units, avg over TeD)",
-       title = "(a) More datasets help, diminishing")
+       title = "More datasets help, diminishing")
 
-# (b) each architecture vs baseline (Dunnett), SD units
-dunn <- as.data.frame(summary(
-  contrast(emmeans(m_z, ~ model_type), method = "trt.vs.ctrl", ref = 1), infer = TRUE)) |>
-  mutate(arch = factor(sub(" - Baseline", "", contrast),
-                       levels = c("MS","MN","M1","M2","M3","MF")))
-pD <- ggplot(dunn, aes(arch, estimate)) +
-  geom_col(fill = "#2471a3", alpha = .85) +
-  geom_errorbar(aes(ymin = lower.CL, ymax = upper.CL), width = .25) +
-  labs(x = NULL, y = "gain vs baseline (SD units)",
-       title = "(b) Deeper refinement, larger gain")
-
-(pC / pD)
+pC
 ```
 
-## (b) Which training datasets help or hurt and when
+## Which training datasets help or hurt and when
 
 We filter out the non-transfer runs to keep the subset where the eight
 `TrD` vary. Next, we fit a linear model to a formula that gives each
@@ -318,7 +328,10 @@ incl <- map_dfr(trd_cols, function(k){ # loop the function over each dataset nam
          upper=et[["upper.CL"]], p=et[["p.value"]]) # one row result
 }) |> arrange(desc(delta_SD)); incl # most helpful first
 
-anova(lm(as.formula(paste("z ~ TeD +", paste(trd_cols, collapse="+"))), data=tr), m_id) # ANOVA to compare the 2 and see whether there a dataset's usefulness depends on the target task
+anova(lm(as.formula(paste("z ~ TeD +", paste(trd_cols, collapse="+"))), data=tr), m_id) # ANOVA to compare the 2 and see whether a dataset's usefulness depends on the target task -> it does
+
+# per-test-set inclusion effect
+for (k in trd_cols) print(summary(emtrends(m_id, ~ TeD, var = k), infer = TRUE))
 ```
 
 We observe that including `TrD8/TrD5/TrD7` helps most.
@@ -327,8 +340,6 @@ interaction is highly significant, cutting the RSS from 2028.7 to 1616.0
 (a difference of 412.7 points or 20% of Model 1's RSS) for those 48
 terms, with a significant F = 15.5 at p \< 2.2e-16: dataset usefulness
 depends on the target task.
-
-## Report figure
 
 ```{r rq2-which-fig, fig.width=4, fig.height=2.8}
 ggplot(incl, aes(delta_SD, reorder(TrD, delta_SD), colour = delta_SD > 0)) +
@@ -339,17 +350,6 @@ ggplot(incl, aes(delta_SD, reorder(TrD, delta_SD), colour = delta_SD > 0)) +
   labs(x = "effect of including dataset (SD units, avg over TeD)", y = NULL,
        title = "Which training sets help vs. hurt")
 ```
-
-## (c) Refinement depth
-
-```{r rq2-depth}
-md <- d |> filter(model_type %in% c("MN","M1","M2","M3","MF"))
-emtrends(lm(z ~ TeD + depth, data = md), ~ 1, var = "depth") |> summary(infer = TRUE)
-```
-
-Filtering to the multi-source models, where `depth` runs 0-4, and
-fitting a linear model that controls for `TeD`, we read off the one
-common slope = SD gained per refined part (0.28, CI [0.26, 0.31]).
 
 # Robustness: do conclusions hold on the bounded (logit) scale?
 
